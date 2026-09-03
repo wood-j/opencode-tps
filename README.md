@@ -50,6 +50,25 @@ The plugin hooks into OpenCode's message streaming events to calculate real-time
 - Displays "-" when no tokens are being generated
 - Automatically clears when streaming completes or errors occur
 
+## Performance patch (this fork)
+
+Upstream v0.1.1 does three things on **every** stream delta (thousands per
+response on large sessions), which causes visible TUI stalls and GC pressure:
+
+1. `new TextEncoder().encode(delta)` — allocator churn per delta
+2. `api.state.part(messageID)` — full part-list fetch per delta (only used to
+   check once whether the message contains a text/reasoning part)
+3. `setVersion(...)` — a re-render per delta
+
+This fork patches all three without changing behavior or display precision:
+
+- Zero-allocation UTF-8 byte-length calculation (replaces the per-delta
+  `TextEncoder`)
+- `hasTextOrReasoning` is cached per message ID (parts only accumulate, so
+  the result is stable once true)
+- Re-render is throttled to at most once per 500 ms; the existing 1 s ticker
+  still refreshes the display, so the TPS figure updates at the same rate
+
 ## License
 
 MIT
