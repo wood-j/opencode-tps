@@ -18,8 +18,29 @@ interface PartDeltaEvent {
   }
 }
 
+// ===== 性能补丁 (2026-09-03) =====
+// 原版每个流式 delta 都会: 1) new TextEncoder()+encode (分配) 2) api.state.part() 全量拉取 3) setVersion 触发 re-render
+// 补丁: 零分配 UTF-8 长度计算; hasText 按 message 缓存; re-render 节流 500ms (显示精度不受影响, 另有 1s tick 兜底)
+const RENDER_MIN_GAP_MS = 500
+
+function utf8ByteLen(s: string): number {
+  let n = 0
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i)
+    if (c < 0x80) n += 1
+    else if (c < 0x800) n += 2
+    else if (c >= 0xd800 && c < 0xdc00) {
+      n += 4
+      i++
+    } else n += 3
+  }
+  return n
+}
+
 const tui: TuiPlugin = async (api, _options, _meta) => {
   const streamSamples = new Map<string, StreamSample[]>()
+  const hasTextCache = new Map<string, boolean>()
+  let lastRender = 0
 
   const [version, setVersion] = createSignal(0)
   const [tick, setTick] = createSignal(0)
@@ -30,8 +51,7 @@ const tui: TuiPlugin = async (api, _options, _meta) => {
   const SINGLE_SAMPLE_MAX_MS = 1000
 
   function estimateTokens(text: string): number {
-    const byteLen = new TextEncoder().encode(text).length
-    return Math.max(1, Math.ceil(byteLen / 5))
+    return Math.max(1, Math.ceil(utf8ByteLen(text) / 5))
   }
 
   function formatTps(value: number): string {
@@ -94,10 +114,16 @@ const tui: TuiPlugin = async (api, _options, _meta) => {
 
     if (evt.properties.field !== "text") return
 
-    const parts = api.state.part(evt.properties.messageID)
-    const hasTextOrReasoning = parts?.some(
-      (p) => p.type === "text" || p.type === "reasoning",
-    )
+    // 补丁: 按 message 缓存 "是否含 text/reasoning part", 避免每 delta 全量 api.state.part() 拉取
+    // (parts 只增不减, 一旦为 true 永为 true; false 不缓存以便后续 delta 复查)
+    let hasTextOrReasoning = hasTextCache.get(evt.properties.messageID)
+    if (hasTextOrReasoning === undefined) {
+      const parts = api.state.part(evt.properties.messageID)
+      hasTextOrReasoning = parts?.some(
+        (p) => p.type === "text" || p.type === "reasoning",
+      )
+      if (hasTextOrReasoning) hasTextCache.set(evt.properties.messageID, true)
+    }
     if (!hasTextOrReasoning) return
 
     const deltaText = evt.properties.delta
@@ -113,7 +139,11 @@ const tui: TuiPlugin = async (api, _options, _meta) => {
     }
     samples.push({ tokens, timestamp: now })
 
-    setVersion((v) => v + 1)
+    // 补丁: re-render 节流 (原版每 delta 一次; 500ms 一次 + 1s tick 兜底, 显示精度不变)
+    if (now - lastRender >= RENDER_MIN_GAP_MS) {
+      lastRender = now
+      setVersion((v) => v + 1)
+    }
   })
 
   const unsubUpdated = api.event.on("message.updated", (evt) => {
